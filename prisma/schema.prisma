@@ -1,0 +1,53 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+model User {
+  id              String           @id @default(uuid())
+  name            String
+  email           String           @unique
+  password        String
+  tasks           Task[]
+  taskCompletions TaskCompletion[]
+  createdAt       DateTime         @default(now())
+}
+
+model Task {
+  id             String           @id @default(uuid())
+  title          String
+  description    String?
+  date           DateTime?
+  time           String?
+  endTime        String?
+  isCompleted    Boolean          @default(false)
+  recurrenceType String           @default("week_days")
+  weekDays       String?
+  weekDayTimes   String?
+  cycleStartDate DateTime?
+  activeDays     Int?
+  restDays       Int?
+  showRestDays   Boolean          @default(false)
+  priority       String           @default("medium")
+  category       String?
+  userId         String
+  user           User             @relation(fields: [userId], references: [id])
+  completions    TaskCompletion[]
+  createdAt      DateTime         @default(now())
+}
+
+model TaskCompletion {
+  id          String   @id @default(uuid())
+  taskId      String
+  userId      String
+  date        DateTime
+  completedAt DateTime @default(now())
+
+  task        Task     @relation(fields: [taskId], references: [id])
+  user        User     @relation(fields: [userId], references: [id])
+
+  @@unique([taskId, userId, date])
+}
