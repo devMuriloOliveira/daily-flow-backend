@@ -1,4 +1,7 @@
 const prisma = require("../lib/prisma");
+const { calculateDailyProgress } = require("../utils/progress");
+
+const DEFAULT_DAILY_COMPLETION_GOAL = 70;
 
 const dayMap = {
   0: "sunday",
@@ -37,6 +40,34 @@ function getDayRange(date) {
   return { start, end };
 }
 
+function addDays(date, amount) {
+  const nextDate = new Date(date);
+  nextDate.setUTCDate(nextDate.getUTCDate() + amount);
+  return nextDate;
+}
+
+function formatDateLabel(dateString) {
+  const date = new Date(`${dateString}T00:00:00.000Z`);
+  const weekDay = ["Dom", "Seg", "Ter", "Qua", "Qui", "Sex", "Sáb"][
+    date.getUTCDay()
+  ];
+  const day = String(date.getUTCDate()).padStart(2, "0");
+  const month = String(date.getUTCMonth() + 1).padStart(2, "0");
+
+  return `${weekDay} ${day}/${month}`;
+}
+
+function getLastPeriodDates(days) {
+  const today = new Date();
+  today.setUTCHours(0, 0, 0, 0);
+
+  const startDate = addDays(today, -(days - 1));
+
+  return Array.from({ length: days }, (_, index) => {
+    return getDateOnly(addDays(startDate, index));
+  });
+}
+
 function isCycleActive(task, selectedDate) {
   if (!task.cycleStartDate || !task.activeDays || !task.restDays) {
     return false;
@@ -59,6 +90,199 @@ function isCycleActive(task, selectedDate) {
   const cyclePosition = diffInDays % cycleTotal;
 
   return cyclePosition < task.activeDays;
+}
+
+async function getTasksForDate(userId, date) {
+  const tasks = await prisma.task.findMany({
+    where: {
+      userId,
+    },
+    orderBy: [
+      {
+        priority: "asc",
+      },
+      {
+        time: "asc",
+      },
+    ],
+  });
+
+  const selectedDate = new Date(`${date}T00:00:00.000Z`);
+  const selectedDay = dayMap[selectedDate.getUTCDay()];
+  const { start, end } = getDayRange(date);
+
+  const completions = await prisma.taskCompletion.findMany({
+    where: {
+      userId,
+      date: {
+        gte: start,
+        lte: end,
+      },
+    },
+  });
+
+  const completedTaskIds = completions.map((completion) => completion.taskId);
+
+  return tasks
+    .filter((task) => {
+      if (task.recurrenceType === "once") {
+        if (!task.date) return false;
+
+        const taskDate = getDateOnly(task.date);
+        return taskDate === date;
+      }
+
+      if (task.recurrenceType === "week_days") {
+        const weekDays = parseJson(task.weekDays, []);
+        return weekDays.includes(selectedDay);
+      }
+
+      if (task.recurrenceType === "cycle") {
+        return isCycleActive(task, selectedDate);
+      }
+
+      return false;
+    })
+    .map((task) => {
+      let formattedTask = task;
+
+      if (task.recurrenceType === "week_days") {
+        const weekDayTimes = parseJson(task.weekDayTimes, {});
+        const dayTime = weekDayTimes[selectedDay];
+
+        if (dayTime) {
+          formattedTask = {
+            ...task,
+            time: normalizeTime(dayTime.time),
+            endTime: normalizeTime(dayTime.endTime),
+          };
+        }
+      }
+
+      return {
+        ...formattedTask,
+        isCompleted: completedTaskIds.includes(task.id),
+      };
+    });
+}
+
+async function getDailyCompletionGoal(userId) {
+  try {
+    const user = await prisma.user.findUnique({
+      where: {
+        id: userId,
+      },
+      select: {
+        dailyCompletionGoal: true,
+      },
+    });
+
+    return user?.dailyCompletionGoal || DEFAULT_DAILY_COMPLETION_GOAL;
+  } catch (error) {
+    if (error.code !== "P2022") {
+      throw error;
+    }
+
+    return DEFAULT_DAILY_COMPLETION_GOAL;
+  }
+}
+
+function getPriorityDistribution(days) {
+  return days.reduce(
+    (distribution, day) => {
+      day.tasks.forEach((task) => {
+        if (task.priority === "high") {
+          distribution.high += 1;
+        } else if (task.priority === "low") {
+          distribution.low += 1;
+        } else {
+          distribution.medium += 1;
+        }
+      });
+
+      return distribution;
+    },
+    { high: 0, medium: 0, low: 0 }
+  );
+}
+
+function getPriorityCompletionByPriority(days) {
+  return days.reduce(
+    (completionByPriority, day) => {
+      day.tasks.forEach((task) => {
+        const priority = ["high", "medium", "low"].includes(task.priority)
+          ? task.priority
+          : "medium";
+
+        completionByPriority[priority].total += 1;
+
+        if (task.isCompleted) {
+          completionByPriority[priority].completed += 1;
+        }
+      });
+
+      return completionByPriority;
+    },
+    {
+      high: { total: 0, completed: 0 },
+      medium: { total: 0, completed: 0 },
+      low: { total: 0, completed: 0 },
+    }
+  );
+}
+
+function calculatePeriodSummary(days) {
+  const activeDays = days.filter((day) => day.totalTasks > 0);
+  const goalReachedDays = activeDays.filter((day) => day.goalReached).length;
+  const totalTasks = days.reduce((sum, day) => sum + day.totalTasks, 0);
+  const completedTasks = days.reduce((sum, day) => sum + day.completedTasks, 0);
+  const totalWeight = days.reduce((sum, day) => sum + day.totalWeight, 0);
+  const completedWeight = days.reduce((sum, day) => sum + day.completedWeight, 0);
+  const completionRate =
+    totalTasks > 0
+      ? Math.round(Math.min(100, Math.max(0, (completedTasks / totalTasks) * 100)))
+      : 0;
+  const weightedProgress =
+    totalWeight > 0
+      ? Math.round(Math.min(100, Math.max(0, (completedWeight / totalWeight) * 100)))
+      : 0;
+  const averageWeightedProgress =
+    activeDays.length > 0
+      ? Math.round(
+          activeDays.reduce((sum, day) => sum + day.weightedProgress, 0) /
+            activeDays.length
+        )
+      : 0;
+  const goalReachedRate =
+    activeDays.length > 0
+      ? Math.round((goalReachedDays / activeDays.length) * 100)
+      : 0;
+  const bestDay =
+    activeDays.reduce((best, day) => {
+      if (!best || day.weightedProgress > best.weightedProgress) {
+        return day;
+      }
+
+      return best;
+    }, null) || null;
+
+  return {
+    totalTasks,
+    completedTasks,
+    completionRate,
+    weightedProgress,
+    activeDays: activeDays.length,
+    averageWeightedProgress,
+    goalReachedDays,
+    goalReachedRate,
+    bestDay: bestDay
+      ? {
+          date: bestDay.date,
+          label: bestDay.label,
+          weightedProgress: bestDay.weightedProgress,
+        }
+      : null,
+  };
 }
 
 async function createTask(request, response) {
@@ -168,63 +392,7 @@ async function listTasks(request, response) {
       return response.json({ tasks });
     }
 
-    const selectedDate = new Date(`${date}T00:00:00.000Z`);
-    const selectedDay = dayMap[selectedDate.getUTCDay()];
-    const { start, end } = getDayRange(date);
-
-    const completions = await prisma.taskCompletion.findMany({
-      where: {
-        userId: request.userId,
-        date: {
-          gte: start,
-          lte: end,
-        },
-      },
-    });
-
-    const completedTaskIds = completions.map((completion) => completion.taskId);
-
-    const filteredTasks = tasks
-      .filter((task) => {
-        if (task.recurrenceType === "once") {
-          if (!task.date) return false;
-
-          const taskDate = getDateOnly(task.date);
-          return taskDate === date;
-        }
-
-        if (task.recurrenceType === "week_days") {
-          const weekDays = parseJson(task.weekDays, []);
-          return weekDays.includes(selectedDay);
-        }
-
-        if (task.recurrenceType === "cycle") {
-          return isCycleActive(task, selectedDate);
-        }
-
-        return false;
-      })
-      .map((task) => {
-        let formattedTask = task;
-
-        if (task.recurrenceType === "week_days") {
-          const weekDayTimes = parseJson(task.weekDayTimes, {});
-          const dayTime = weekDayTimes[selectedDay];
-
-          if (dayTime) {
-            formattedTask = {
-              ...task,
-              time: normalizeTime(dayTime.time),
-              endTime: normalizeTime(dayTime.endTime),
-            };
-          }
-        }
-
-        return {
-          ...formattedTask,
-          isCompleted: completedTaskIds.includes(task.id),
-        };
-      });
+    const filteredTasks = await getTasksForDate(request.userId, date);
 
     return response.json({ tasks: filteredTasks });
   } catch (error) {
@@ -445,95 +613,59 @@ async function updateTask(request, response) {
 
 async function getStatistics(request, response) {
   try {
-    const tasks = await prisma.task.findMany({
-      where: {
-        userId: request.userId,
-      },
-    });
+    const requestedPeriod = Number(request.query.period) || 7;
+    const periodDays = requestedPeriod === 30 ? 30 : 7;
+    const dailyCompletionGoal = await getDailyCompletionGoal(request.userId);
+    const periodDates = getLastPeriodDates(periodDays);
+    const days = await Promise.all(
+      periodDates.map(async (date) => {
+        const tasks = await getTasksForDate(request.userId, date);
+        const dailyProgress = calculateDailyProgress(tasks, dailyCompletionGoal);
 
-    const completions = await prisma.taskCompletion.findMany({
-      where: {
-        userId: request.userId,
-      },
-    });
+        return {
+          date,
+          label: formatDateLabel(date),
+          totalTasks: dailyProgress.totalTasks,
+          completedTasks: dailyProgress.completedTasks,
+          completionRate: dailyProgress.completionRate,
+          weightedProgress: dailyProgress.progressPercent,
+          totalWeight: dailyProgress.totalWeight,
+          completedWeight: dailyProgress.completedWeight,
+          dailyCompletionGoal,
+          goalReached: dailyProgress.goalReached,
+          tasks,
+        };
+      })
+    );
 
-    const totalTasks = tasks.length;
-    const completedTasks = completions.length;
-
-    const completionRate =
-      totalTasks > 0 ? Math.round((completedTasks / totalTasks) * 100) : 0;
-
-    const today = new Date();
-    today.setHours(0, 0, 0, 0);
-
-    const weekDays = ["Dom", "Seg", "Ter", "Qua", "Qui", "Sex", "Sáb"];
-
-    const weeklyCompleted = weekDays.map((label, index) => {
-      const count = completions.filter((completion) => {
-        const date = new Date(completion.date);
-        return date.getUTCDay() === index;
-      }).length;
-    
-      return {
-        day: label,
-        completed: count,
-      };
-    });
-
-    const completedDates = [
-      ...new Set(
-        completions.map((completion) =>
-          new Date(completion.date).toISOString().split("T")[0]
-        )
-      ),
-    ];
-
-    let currentStreak = 0;
-    let currentDate = new Date(today);
-
-    while (
-      completedDates.includes(currentDate.toISOString().split("T")[0])
-    ) {
-      currentStreak++;
-      currentDate.setDate(currentDate.getDate() - 1);
-    }
-
-    let bestStreak = 0;
-    let tempStreak = 0;
-
-    const sortedDates = completedDates.sort();
-
-    for (let i = 0; i < sortedDates.length; i++) {
-      if (i === 0) {
-        tempStreak = 1;
-      } else {
-        const previousDate = new Date(sortedDates[i - 1]);
-        const current = new Date(sortedDates[i]);
-
-        previousDate.setDate(previousDate.getDate() + 1);
-
-        if (
-          previousDate.toISOString().split("T")[0] ===
-          current.toISOString().split("T")[0]
-        ) {
-          tempStreak++;
-        } else {
-          tempStreak = 1;
-        }
-      }
-
-      if (tempStreak > bestStreak) {
-        bestStreak = tempStreak;
-      }
-    }
+    const summary = calculatePeriodSummary(days);
+    const priorityDistribution = getPriorityDistribution(days);
+    const priorityCompletion = getPriorityCompletionByPriority(days);
+    const chartDays = days.map(({ tasks, ...day }) => day);
 
     return response.json({
-      totalTasks,
-      completedTasks,
-      completionRate,
-      weeklyCompleted,
-      currentStreak,
-      bestStreak,
+      period: {
+        days: periodDays,
+        startDate: periodDates[0],
+        endDate: periodDates[periodDates.length - 1],
+      },
+      totalTasks: summary.totalTasks,
+      completedTasks: summary.completedTasks,
+      completionRate: summary.completionRate,
+      weightedProgress: summary.weightedProgress,
+      dailyCompletionGoal,
+      goalReachedDays: summary.goalReachedDays,
+      goalReachedRate: summary.goalReachedRate,
+      activeDays: summary.activeDays,
+      averageWeightedProgress: summary.averageWeightedProgress,
+      bestDay: summary.bestDay,
+      priorityDistribution,
+      priorityCompletion,
+      days: chartDays,
+      weeklyCompleted: chartDays.map((day) => ({
+        day: day.label,
+        completed: day.completedTasks,
+      })),
     });
   } catch (error) {
     console.log(error);
@@ -543,7 +675,6 @@ async function getStatistics(request, response) {
     });
   }
 }
-
 module.exports = {
   createTask,
   listTasks,

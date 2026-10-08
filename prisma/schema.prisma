@@ -11,6 +11,7 @@ model User {
   name            String
   email           String           @unique
   password        String
+  dailyCompletionGoal Int           @default(70)
   tasks           Task[]
   taskCompletions TaskCompletion[]
   createdAt       DateTime         @default(now())
