@@ -1,7 +1,13 @@
 const prisma = require("../lib/prisma");
 const { calculateDailyProgress } = require("../utils/progress");
+const {
+  calculatePeriodSummary,
+  getPriorityCompletionByPriority,
+  getPriorityDistribution,
+} = require("../utils/statistics");
 
 const DEFAULT_DAILY_COMPLETION_GOAL = 70;
+const APP_TIME_ZONE = process.env.APP_TIME_ZONE || "America/Sao_Paulo";
 
 const dayMap = {
   0: "sunday",
@@ -33,6 +39,10 @@ function getDateOnly(date) {
   return date.toISOString().split("T")[0];
 }
 
+function isValidDateOnly(date) {
+  return /^\d{4}-\d{2}-\d{2}$/.test(date);
+}
+
 function getDayRange(date) {
   const start = new Date(`${date}T00:00:00.000Z`);
   const end = new Date(`${date}T23:59:59.999Z`);
@@ -57,9 +67,24 @@ function formatDateLabel(dateString) {
   return `${weekDay} ${day}/${month}`;
 }
 
+function getTodayDate(timeZone = APP_TIME_ZONE) {
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).formatToParts(new Date());
+
+  const dateParts = parts.reduce((accumulator, part) => {
+    accumulator[part.type] = part.value;
+    return accumulator;
+  }, {});
+
+  return `${dateParts.year}-${dateParts.month}-${dateParts.day}`;
+}
+
 function getLastPeriodDates(days) {
-  const today = new Date();
-  today.setUTCHours(0, 0, 0, 0);
+  const today = new Date(`${getTodayDate()}T00:00:00.000Z`);
 
   const startDate = addDays(today, -(days - 1));
 
@@ -93,6 +118,10 @@ function isCycleActive(task, selectedDate) {
 }
 
 async function getTasksForDate(userId, date) {
+  if (!isValidDateOnly(date)) {
+    throw new Error(`Invalid statistics date: ${date}`);
+  }
+
   const tasks = await prisma.task.findMany({
     where: {
       userId,
@@ -111,17 +140,28 @@ async function getTasksForDate(userId, date) {
   const selectedDay = dayMap[selectedDate.getUTCDay()];
   const { start, end } = getDayRange(date);
 
-  const completions = await prisma.taskCompletion.findMany({
-    where: {
-      userId,
-      date: {
-        gte: start,
-        lte: end,
-      },
-    },
-  });
+  const taskIds = tasks.map((task) => task.id);
+  const completions = taskIds.length
+    ? await prisma.taskCompletion.findMany({
+        where: {
+          userId,
+          taskId: {
+            in: taskIds,
+          },
+          date: {
+            gte: start,
+            lte: end,
+          },
+        },
+        select: {
+          taskId: true,
+        },
+      })
+    : [];
 
-  const completedTaskIds = completions.map((completion) => completion.taskId);
+  const completedTaskIds = new Set(
+    completions.map((completion) => completion.taskId)
+  );
 
   return tasks
     .filter((task) => {
@@ -161,7 +201,7 @@ async function getTasksForDate(userId, date) {
 
       return {
         ...formattedTask,
-        isCompleted: completedTaskIds.includes(task.id),
+        isCompleted: completedTaskIds.has(task.id),
       };
     });
 }
@@ -187,103 +227,6 @@ async function getDailyCompletionGoal(userId) {
   }
 }
 
-function getPriorityDistribution(days) {
-  return days.reduce(
-    (distribution, day) => {
-      day.tasks.forEach((task) => {
-        if (task.priority === "high") {
-          distribution.high += 1;
-        } else if (task.priority === "low") {
-          distribution.low += 1;
-        } else {
-          distribution.medium += 1;
-        }
-      });
-
-      return distribution;
-    },
-    { high: 0, medium: 0, low: 0 }
-  );
-}
-
-function getPriorityCompletionByPriority(days) {
-  return days.reduce(
-    (completionByPriority, day) => {
-      day.tasks.forEach((task) => {
-        const priority = ["high", "medium", "low"].includes(task.priority)
-          ? task.priority
-          : "medium";
-
-        completionByPriority[priority].total += 1;
-
-        if (task.isCompleted) {
-          completionByPriority[priority].completed += 1;
-        }
-      });
-
-      return completionByPriority;
-    },
-    {
-      high: { total: 0, completed: 0 },
-      medium: { total: 0, completed: 0 },
-      low: { total: 0, completed: 0 },
-    }
-  );
-}
-
-function calculatePeriodSummary(days) {
-  const activeDays = days.filter((day) => day.totalTasks > 0);
-  const goalReachedDays = activeDays.filter((day) => day.goalReached).length;
-  const totalTasks = days.reduce((sum, day) => sum + day.totalTasks, 0);
-  const completedTasks = days.reduce((sum, day) => sum + day.completedTasks, 0);
-  const totalWeight = days.reduce((sum, day) => sum + day.totalWeight, 0);
-  const completedWeight = days.reduce((sum, day) => sum + day.completedWeight, 0);
-  const completionRate =
-    totalTasks > 0
-      ? Math.round(Math.min(100, Math.max(0, (completedTasks / totalTasks) * 100)))
-      : 0;
-  const weightedProgress =
-    totalWeight > 0
-      ? Math.round(Math.min(100, Math.max(0, (completedWeight / totalWeight) * 100)))
-      : 0;
-  const averageWeightedProgress =
-    activeDays.length > 0
-      ? Math.round(
-          activeDays.reduce((sum, day) => sum + day.weightedProgress, 0) /
-            activeDays.length
-        )
-      : 0;
-  const goalReachedRate =
-    activeDays.length > 0
-      ? Math.round((goalReachedDays / activeDays.length) * 100)
-      : 0;
-  const bestDay =
-    activeDays.reduce((best, day) => {
-      if (!best || day.weightedProgress > best.weightedProgress) {
-        return day;
-      }
-
-      return best;
-    }, null) || null;
-
-  return {
-    totalTasks,
-    completedTasks,
-    completionRate,
-    weightedProgress,
-    activeDays: activeDays.length,
-    averageWeightedProgress,
-    goalReachedDays,
-    goalReachedRate,
-    bestDay: bestDay
-      ? {
-          date: bestDay.date,
-          label: bestDay.label,
-          weightedProgress: bestDay.weightedProgress,
-        }
-      : null,
-  };
-}
 
 async function createTask(request, response) {
   try {
